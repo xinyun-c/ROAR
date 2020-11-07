@@ -53,6 +53,9 @@ class ARMarkerLocalizationDetector(Detector):
 
         self.running = True
 
+        self.R_value = None
+        self.T_value = None
+
     def config_AR(self):
         """
         compute the configuration of the local coordinates of ar tags with respect to world frame
@@ -105,8 +108,8 @@ class ARMarkerLocalizationDetector(Detector):
                     continue
             else:
                 continue
-            cv2.imshow("img from ar marker localization", img_arr)
-            cv2.waitKey(1)
+            # cv2.imshow("img from ar marker localization", img_arr)
+            # cv2.waitKey(1)
             # Copy image then convert it to grayscale
             img_arr = img_arr.copy()
             if len(img_arr) == 3:
@@ -115,12 +118,15 @@ class ARMarkerLocalizationDetector(Detector):
                 gray = img_arr
 
             # Get the position list from the gray scale image, if there are ar tags
+            start = time.time()
             positions_list = self.get_position_list(gray)
-
+            end = time.time()
+            print(f"Get position list fps: {1 / (end - start)}")
             if positions_list is not None:
                 # Average out the ar tag positions based on a weighted average
                 self.prev_config = np.array(self.avg_RT(positions_list))
                 self.prev_gray, self.prev_depth = gray, depth_arr
+                print("detected", self.get_global_position())
                 continue
 
             elif self.prev_gray is not None and img_arr is not None and depth_arr is not None:  # KEYFRAME MATCHING
@@ -128,16 +134,26 @@ class ARMarkerLocalizationDetector(Detector):
                     continue
 
                 R, T = self.keyframe_matching(gray, depth_arr)
+                # print("R: ", R)
+                # print("T: ", T)
                 if T is None or R is None:
+                    if self.R_value is None or self.T_value is None:
+                        continue
                     # self.cur_gray, self.cur_depth = None, None
-                    return None, False
+                    # return None, False
+                    R = self.R_value
+                    T = self.T_value
+                else:
+                    self.R_value = R
+                    self.T_value = T
 
                 T = T / 1000  # Normalize millimeters to meters
                 g = np.hstack((R, T))
                 g = np.vstack((g, [0, 0, 0, 1]))
 
-                self.prev_config = np.dot(self.prev_config, g)
+                self.prev_config = np.asarray(self.prev_config @ g)
                 self.prev_gray, self.prev_depth = gray, depth_arr
+                # print(self.get_global_position())
 
     def get_position_list(self, gray=None):  # Get list of all global positions based on each ar tag in the frame
         """
@@ -154,7 +170,15 @@ class ARMarkerLocalizationDetector(Detector):
             # Get rvec and tvec of each id relative to detected ar tags
             rvecs, tvecs, _ = aruco.estimatePoseSingleMarkers(corners, 0.2032,
                                                               self.agent.front_rgb_camera.intrinsics_matrix,
-                                                              self.agent.front_rgb_camera.distortion_coefficient)
+                                                              np.array(self.agent.front_rgb_camera.distortion_coefficient))
+
+            # superimpose an axis for each AR detected
+            # (rvecs - tvecs).any()  # get rid of that nasty numpy value array error
+            # aruco.drawDetectedMarkers(gray, corners)  # Draw A square around the markers
+            # image = aruco.drawAxis(gray, self.agent.front_depth_camera.intrinsics_matrix, np.array(self.agent.front_rgb_camera.distortion_coefficient), rvecs, tvecs, 0.01)  # Draw axis
+            #
+            # cv2.imshow("Marker axis", image)
+            # cv2.waitKey(1)
 
             config_list, dists = [], []
             for i, val in enumerate(ids):
@@ -235,6 +259,8 @@ class ARMarkerLocalizationDetector(Detector):
         # prev_gray is the train image and cur_gray is the query image
         matches = self.bf.match(cur_des, prev_des)
 
+        if len(matches) == 0:
+            self.logger.debug("Can't find matches between frames")
         # compute local 3D points
         cur_p3d, prev_p3d = self.compute3D(matches, cur_kp, prev_kp, cur_depth)
 
@@ -277,8 +303,10 @@ class ARMarkerLocalizationDetector(Detector):
         current_depth = np.diag(cur_depth[cur_2d[1].astype(int), cur_2d[0].astype(int)])
         previous_depth = np.diag(self.prev_depth[prev_2d[1].astype(int), prev_2d[0].astype(int)])
 
-        return (np.linalg.pinv(self.agent.front_depth_camera.intrinsics_matrix) @ cur_2d @ current_depth).T, (
-                self.agent.front_depth_camera.intrinsics_matrix @ prev_2d @ previous_depth).T
+        ret = (np.linalg.pinv(self.agent.front_depth_camera.intrinsics_matrix) @ cur_2d @ current_depth).T, \
+              (np.linalg.pinv(self.agent.front_depth_camera.intrinsics_matrix) @ prev_2d @ previous_depth).T
+
+        return ret
 
     def get_rigid_transformation3d(self, A, B):
         """
